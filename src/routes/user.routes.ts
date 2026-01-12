@@ -29,6 +29,7 @@ router.get("/me", async (req: AuthenticatedRequest, res) => {
       firstName: user.firstName,
       lastName: user.lastName,
       role: user.role,
+      profilePictureUrl: user.profilePictureUrl,
     });
   } catch (error: any) {
     console.error("Get user info error:", error);

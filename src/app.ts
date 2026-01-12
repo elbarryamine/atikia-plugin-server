@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import propertiesRoutes from './routes/properties.routes';
 import userRoutes from './routes/user.routes';
 import uploadRoutes from './routes/upload.routes';
@@ -6,6 +7,7 @@ import uploadRoutes from './routes/upload.routes';
 const app = express();
 
 // Middleware
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // Routes
