@@ -6,6 +6,8 @@ import { googleAddresses } from "../database/schemas/googleAddresses";
 import { eq, and } from "drizzle-orm";
 import { StorageService } from "../services/storage.service";
 import { AZURE_STORAGE_CONTAINERS } from "../constants/storage.constants";
+import { createPropertySchema } from "../validation/createPropertySchema";
+import slugify from "slugify";
 
 const router = Router();
 const storageService = new StorageService();
@@ -33,15 +35,26 @@ router.post("/bulk", async (req: AuthenticatedRequest, res) => {
       try {
         const propertyData = propertiesData[i];
 
-        // Validate required fields
-        if (!propertyData.latitude || !propertyData.longitude) {
-          throw new Error("latitude and longitude are required");
+        const parsed = createPropertySchema.safeParse(propertyData);
+        if (!parsed.success) {
+          const msg = parsed.error.issues
+            .map((iss) => {
+              const path = iss.path.length ? iss.path.join(".") : "property";
+              return `${path}: ${iss.message}`;
+            })
+            .join("; ");
+          throw new Error(msg);
         }
+
+        const input = parsed.data;
+
+        // Validate required fields
+        // Note: latitude/longitude are already validated by schema.
 
         // Get or create google address
         let googleAddressId: string;
-        const latStr = propertyData.latitude.toString();
-        const lngStr = propertyData.longitude.toString();
+        const latStr = input.latitude.toString();
+        const lngStr = input.longitude.toString();
 
         const existingAddress = await db.query.googleAddresses.findFirst({
           where: and(
@@ -54,9 +67,7 @@ router.post("/bulk", async (req: AuthenticatedRequest, res) => {
           googleAddressId = existingAddress.id;
         } else {
           // Create minimal google address entry
-          const defaultAddress =
-            propertyData.fullAddress ||
-            `${propertyData.latitude}, ${propertyData.longitude}`;
+          const defaultAddress = `${input.latitude}, ${input.longitude}`;
           const [newAddress] = await db
             .insert(googleAddresses)
             .values({
@@ -66,8 +77,8 @@ router.post("/bulk", async (req: AuthenticatedRequest, res) => {
                 address: defaultAddress,
                 formattedAddress: defaultAddress,
                 placeId: "",
-                latitude: propertyData.latitude,
-                longitude: propertyData.longitude,
+                latitude: input.latitude,
+                longitude: input.longitude,
                 components: {},
               } as any,
               createdAt: new Date(),
@@ -78,83 +89,98 @@ router.post("/bulk", async (req: AuthenticatedRequest, res) => {
         }
 
         // Prepare property data with required fields
-        const fullAddress =
-          propertyData.fullAddress ||
-          `${propertyData.latitude}, ${propertyData.longitude}`;
-        const compactAddress = propertyData.compactAddress || fullAddress;
+        const fullAddress = `${input.latitude}, ${input.longitude}`;
+        const compactAddress = fullAddress;
 
         // Handle cover image if coverImageId is provided
         let coverFilename: string | undefined;
         let coverFileUrl: string | undefined;
         let coverContentType: string | undefined;
 
-        if (propertyData.coverImageId) {
-          try {
-            // Get content type from temp file before moving
-            coverContentType = await storageService.getFileContentType(
-              propertyData.coverImageId
-            );
+        // coverImageId is required by the schema
+        coverContentType = await storageService.getFileContentType(
+          input.coverImageId
+        );
+        const finalCoverFilename = `property-${Date.now()}-cover.jpg`;
+        const coverUrl = await storageService.moveFileFromTemp(
+          input.coverImageId,
+          AZURE_STORAGE_CONTAINERS.PROPERTIES_IMAGES,
+          finalCoverFilename
+        );
+        coverFilename = finalCoverFilename;
+        coverFileUrl = coverUrl;
 
-            // Move file from temp to properties-images container
-            const finalCoverFilename = `property-${Date.now()}-cover.jpg`;
-            const coverUrl = await storageService.moveFileFromTemp(
-              propertyData.coverImageId,
+        // Gallery images (optional)
+        let galleryImages:
+          | Array<{ filename: string; url: string; contentType: string }>
+          | undefined;
+        if (input.galleryImageIds && input.galleryImageIds.length > 0) {
+          galleryImages = [];
+          for (let g = 0; g < input.galleryImageIds.length; g++) {
+            const id = input.galleryImageIds[g];
+            const contentType = await storageService.getFileContentType(id);
+            const finalGalleryFilename = `property-${Date.now()}-gallery-${g}.jpg`;
+            const url = await storageService.moveFileFromTemp(
+              id,
               AZURE_STORAGE_CONTAINERS.PROPERTIES_IMAGES,
-              finalCoverFilename
+              finalGalleryFilename
             );
-
-            coverFilename = finalCoverFilename;
-            coverFileUrl = coverUrl;
-          } catch (error: any) {
-            // Log error but don't fail the entire property creation
-            console.error(
-              `Failed to process cover image for property ${i}:`,
-              error.message
-            );
-            // Continue without cover image - property will be created without it
-            // You may want to throw an error here if cover image is required
+            galleryImages.push({
+              filename: finalGalleryFilename,
+              url,
+              contentType,
+            });
           }
         }
+
+        // Generate slug from title (or null if no title)
+        const slug = input.title
+          ? slugify(input.title, { lower: true, strict: true }) +
+            "-" +
+            Date.now()
+          : null;
 
         // Insert property with user ID
         await db.insert(properties).values({
           ownerId: userId,
           status: "under_review",
-          description: propertyData.description,
-          type: propertyData.type,
-          transactionType: propertyData.transactionType,
-          propertyStyle: propertyData.propertyStyle,
-          propertyUsage: propertyData.propertyUsage,
-          isFurnished: propertyData.isFurnished ?? false,
-          finishingQuality: propertyData.finishingQuality,
-          sunLightLevel: propertyData.sunLightLevel,
-          yearBuilt: propertyData.yearBuilt,
-          price: propertyData.price,
-          isNegotiable: propertyData.isNegotiable ?? true,
-          propertyRentContractMonths: propertyData.propertyRentContractMonths,
-          propertyRentDepositMonths: propertyData.propertyRentDepositMonths,
+          title: input.title || null,
+          slug,
+          description: input.description,
+          type: input.type,
+          transactionType: input.transactionType,
+          propertyStyle: input.propertyStyle,
+          propertyUsage: input.propertyUsage,
+          isFurnished: input.isFurnished,
+          finishingQuality: input.finishingQuality,
+          sunLightLevel: input.sunLightLevel,
+          yearBuilt: input.yearBuilt,
+          price: input.price,
+          isNegotiable: input.isNegotiable ?? true,
+          propertyRentContractMonths: input.propertyRentContractMonths,
+          propertyRentDepositMonths: input.propertyRentDepositMonths,
           fullAddress,
           compactAddress,
           googleAddressId,
-          latitude: propertyData.latitude,
-          longitude: propertyData.longitude,
-          floorNumber: propertyData.floorNumber,
-          totalFloor: propertyData.totalFloor,
-          totalWaterClosets: propertyData.totalWaterClosets,
-          totalBathrooms: propertyData.totalBathrooms,
-          totalBedrooms: propertyData.totalBedrooms,
-          totalSalons: propertyData.totalSalons,
-          totalKitchens: propertyData.totalKitchens,
-          areaSize: propertyData.areaSize,
-          buildingSize: propertyData.buildingSize,
+          latitude: input.latitude,
+          longitude: input.longitude,
+          floorNumber: input.floorNumber,
+          totalFloor: input.totalFloor,
+          totalWaterClosets: input.totalWaterClosets,
+          totalBathrooms: input.totalBathrooms,
+          totalBedrooms: input.totalBedrooms,
+          totalSalons: input.totalSalons,
+          totalKitchens: input.totalKitchens,
+          areaSize: input.areaSize,
+          buildingSize: input.buildingSize,
           coverFilename,
           coverFileUrl,
           coverContentType,
-          galleryImages: propertyData.galleryImages,
-          youtubeVideoUrl: propertyData.youtubeVideoUrl,
-          matterPortUrl: propertyData.matterPortUrl,
-          floorPlanUrl: propertyData.floorPlanUrl,
-          visitDays: propertyData.visitDays,
+          galleryImages,
+          youtubeVideoUrl: input.youtubeVideoUrl,
+          matterPortUrl: input.matterPortUrl,
+          // floorPlanUrl is not in main backend schema; ignored here.
+          visitDays: input.visitDays,
           createdAt: new Date(),
           updatedAt: new Date(),
         });
